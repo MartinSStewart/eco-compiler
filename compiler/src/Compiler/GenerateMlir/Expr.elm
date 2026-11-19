@@ -2996,8 +2996,8 @@ compileSkippedBindings ctx bindings =
 
 
 {-| Returns, outermost first, the bindings of `innermostFirst` (a let chain,
-innermost binding first) that `exprs` need, directly or through other needed
-bindings.
+innermost binding first) that `exprs` or the destructurings at the head of
+`encoderExpr` need, directly or through other needed bindings.
 
 The bindings above a fused encoder are compiled before it, and most of them
 only built the encoder that fusion replaces, such as the list of item encoders
@@ -3005,9 +3005,28 @@ of `sequence (List.map f xs)`. Compiling those would build the whole unused
 encoder at run time.
 
 -}
-liveBindings : List Mono.MonoExpr -> List ( Name.Name, Mono.MonoExpr ) -> List ( Name.Name, Mono.MonoExpr )
-liveBindings exprs innermostFirst =
+liveBindings : List Mono.MonoExpr -> Mono.MonoExpr -> List ( Name.Name, Mono.MonoExpr ) -> List ( Name.Name, Mono.MonoExpr )
+liveBindings exprs encoderExpr innermostFirst =
     let
+        -- `let (Triangle t) = f x in ...` binds `_v0 = f x` in the chain and
+        -- destructures `t` from it at the head of the encoder. The reified
+        -- nodes read `t`, never `_v0`, so the roots of those destructurings
+        -- are needed too, as is whatever the lets after them read.
+        headDestructRoots : Mono.MonoExpr -> Set.Set Name.Name -> Set.Set Name.Name
+        headDestructRoots expr acc =
+            case expr of
+                Mono.MonoLet (Mono.MonoDef _ defExpr) body _ ->
+                    headDestructRoots body (localsOf defExpr acc)
+
+                Mono.MonoLet (Mono.MonoTailDef _ _ defExpr) body _ ->
+                    headDestructRoots body (localsOf defExpr acc)
+
+                Mono.MonoDestruct (Mono.MonoDestructor _ path _) body _ ->
+                    headDestructRoots body (Set.insert (pathRootName path) acc)
+
+                _ ->
+                    acc
+
         localsOf : Mono.MonoExpr -> Set.Set Name.Name -> Set.Set Name.Name
         localsOf expr acc =
             MonoTraverse.foldExpr
@@ -3042,7 +3061,7 @@ liveBindings exprs innermostFirst =
             else
                 ( needed, kept )
         )
-        ( List.foldl localsOf Set.empty exprs, [] )
+        ( List.foldl localsOf (headDestructRoots encoderExpr Set.empty) exprs, [] )
         innermostFirst
         |> Tuple.second
 
@@ -3098,7 +3117,7 @@ tryEncoderFusionWithBindings ctx accumulated encoderExpr =
                             bfExprCompiler (fusedLetsFromChain accumulated encoderExpr)
 
                         ( bindingOps, ctxAfterBindings ) =
-                            compileSkippedBindings ctx (liveBindings (BFReify.nodeExprs reifiedNodes) accumulated)
+                            compileSkippedBindings ctx (liveBindings (BFReify.nodeExprs reifiedNodes) encoderExpr accumulated)
 
                         -- Each list a loop counts at run time, compiled once.
                         ( loopListOps, ctxAfterLists ) =
